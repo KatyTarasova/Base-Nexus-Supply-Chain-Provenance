@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.21;
+
+contract NexusSupplyChainProvenance {
+    enum CargoStatus { Pending, InTransit, Delivered, Canceled }
+
+    struct Shipment {
+        address payable sender;
+        uint256 insuranceValue;
+        uint256 registeredAt;
+        CargoStatus status;
+        bytes32 itemHash;
+    }
+
+    address payable public immutable registryAdmin;
+    string public registryDescriptor;
+    uint256 public trackingFeeBps; // 150 = 1.5%
+    uint256 public shipmentCounter;
+    uint256 public accumulatedFees;
+    uint256 public qualityAssurancePool;
+    bool public isRegistryPaused;
+
+    mapping(bytes32 => bool) public authorizedCarriers;
+    mapping(uint256 => Shipment) public shipments;
+
+    event CarrierAuthorized(bytes32 indexed carrierId);
+    event TrackingFeeAdjusted(uint256 newFeeBps);
+    event ShipmentCanceled(uint256 indexed shipmentId, uint256 refundedInsurance);
+    event CargoDelivered(uint256 indexed shipmentId, uint256 payout);
+    event ReservesDrained(address indexed admin, uint256 amount);
+    event AssurancePoolFunded(address indexed donor, uint256 amount);
+    event TransitFeesHarvested(address indexed admin, uint256 amount);
+    event ShipmentInitiated(uint256 indexed shipmentId, address indexed sender, uint256 insurance);
+    event InsuranceRepriced(uint256 indexed shipmentId, uint256 newInsurance);
+    event CarrierRevoked(bytes32 indexed carrierId);
+    event RegistryPauseToggled(bool isPaused);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyAdmin() {
+        require(msg.sender == registryAdmin, "NexusChain: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isRegistryPaused, "NexusChain: Registry paused");
+        _;
+    }
+
+    constructor() {
+        registryAdmin = payable(msg.sender);
+        registryDescriptor = "Nexus Base Supply Chain Provenance Core v1";
+        trackingFeeBps = 150; // 1.5%
+        isRegistryPaused = false;
+        authorizedCarriers[0x4d414552534b5f474c4f42414c5f4c4f47495354494353000000000000000000] = true;
+    }
+
+    // 1. addAuthorizedCarrier
+    function addAuthorizedCarrier(bytes32 carrierId) external onlyAdmin {
+        require(!authorizedCarriers[carrierId], "NexusChain: Carrier exists");
+        authorizedCarriers[carrierId] = true;
+        emit CarrierAuthorized(carrierId);
+    }
+
+    // 2. adjustTrackingFeeBps
+    function adjustTrackingFeeBps(uint256 newFeeBps) external onlyAdmin {
+        require(newFeeBps <= 1000, "NexusChain: Fee cap 10%");
+        trackingFeeBps = newFeeBps;
+        emit TrackingFeeAdjusted(newFeeBps);
+    }
+
+    // 3. cancelShipmentTransit
+    function cancelShipmentTransit(uint256 shipmentId) external {
+        Shipment storage s = shipments[shipmentId];
+        require(shipmentId > 0 && shipmentId <= shipmentCounter, "NexusChain: Invalid ID");
+        require(msg.sender == s.sender || msg.sender == registryAdmin, "NexusChain: Unauthorized");
+        require(s.status == CargoStatus.Pending || s.status == CargoStatus.InTransit, "NexusChain: Not cancellable");
+
+        s.status = CargoStatus.Canceled;
+        uint256 refund = s.insuranceValue;
+        s.insuranceValue = 0;
+
+        if (refund > 0) {
+            (bool sent, ) = s.sender.call{value: refund}("");
+            require(sent, "NexusChain: Refund failed");
+        }
+
+        emit ShipmentCanceled(shipmentId, refund);
+    }
+
+    // 4. deliverShipmentCargo
+    function deliverShipmentCargo(uint256 shipmentId) external {
+        Shipment storage s = shipments[shipmentId];
+        require(shipmentId > 0 && shipmentId <= shipmentCounter, "NexusChain: Invalid ID");
+        require(msg.sender == s.sender || msg.sender == registryAdmin, "NexusChain: Unauthorized");
+        require(s.status == CargoStatus.InTransit, "NexusChain: Not in transit");
+
+        s.status = CargoStatus.Delivered;
+        uint256 payout = s.insuranceValue;
+        s.insuranceValue = 0;
+
+        if (payout > 0) {
+            (bool sent, ) = s.sender.call{value: payout}("");
+            require(sent, "NexusChain: Insurance return failed");
+        }
+
+        emit CargoDelivered(shipmentId, payout);
+    }
+
+    // 5. drainTreasuryReserves
+    function drainTreasuryReserves() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "NexusChain: Zero balance");
+
+        accumulatedFees = 0;
+        qualityAssurancePool = 0;
+
+        (bool sent, ) = registryAdmin.call{value: balance}("");
+        require(sent, "NexusChain: Sweep failed");
+
+        emit ReservesDrained(registryAdmin, balance);
+    }
+
+    // 6. fundQualityAssurancePool
+    function fundQualityAssurancePool() external payable whenNotPaused {
+        require(msg.value > 0, "NexusChain: Zero funding");
+        qualityAssurancePool += msg.value;
+        emit AssurancePoolFunded(msg.sender, msg.value);
+    }
+
+    // 7. harvestTransitFees
+    function harvestTransitFees() external onlyAdmin {
+        uint256 amount = accumulatedFees + qualityAssurancePool;
+        if (amount > address(this).balance) {
+            amount = address(this).balance;
+        }
+        require(amount > 0, "NexusChain: Zero fees available");
+
+        accumulatedFees = 0;
+        qualityAssurancePool = 0;
+
+        (bool sent, ) = registryAdmin.call{value: amount}("");
+        require(sent, "NexusChain: Harvest failed");
+
+        emit TransitFeesHarvested(registryAdmin, amount);
+    }
+
+    // 8. initiateCargoShipment
+    function initiateCargoShipment(bytes32 carrierId, bytes32 itemHash) external payable whenNotPaused returns (uint256) {
+        require(authorizedCarriers[carrierId], "NexusChain: Unknown carrier");
+        require(msg.value > 0, "NexusChain: Insurance required");
+
+        uint256 fee = (msg.value * trackingFeeBps) / 10000;
+        uint256 netInsurance = msg.value - fee;
+        accumulatedFees += fee;
+
+        shipmentCounter++;
+        shipments[shipmentCounter] = Shipment({
+            sender: payable(msg.sender),
+            insuranceValue: netInsurance,
+            registeredAt: block.timestamp,
+            status: CargoStatus.InTransit,
+            itemHash: itemHash
+        });
+
+        emit ShipmentInitiated(shipmentCounter, msg.sender, netInsurance);
+        return shipmentCounter;
+    }
+
+    // 9. repriceShipmentInsurance
+    function repriceShipmentInsurance(uint256 shipmentId, uint256 newInsuranceWei) external {
+        Shipment storage s = shipments[shipmentId];
+        require(shipmentId > 0 && shipmentId <= shipmentCounter, "NexusChain: Invalid ID");
+        require(msg.sender == s.sender || msg.sender == registryAdmin, "NexusChain: Unauthorized");
+        require(s.status == CargoStatus.Pending || s.status == CargoStatus.InTransit, "NexusChain: Cannot reprice");
+
+        s.insuranceValue = newInsuranceWei;
+        emit InsuranceRepriced(shipmentId, newInsuranceWei);
+    }
+
+    // 10. revokeCarrierAuthorization
+    function revokeCarrierAuthorization(bytes32 carrierId) external onlyAdmin {
+        require(authorizedCarriers[carrierId], "NexusChain: Carrier not found");
+        authorizedCarriers[carrierId] = false;
+        emit CarrierRevoked(carrierId);
+    }
+
+    // 11. toggleSupplyChainPause
+    function toggleSupplyChainPause(bool isPaused) external onlyAdmin {
+        isRegistryPaused = isPaused;
+        emit RegistryPauseToggled(isPaused);
+    }
+
+    // 12. updateRegistryDescriptor
+    function updateRegistryDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "NexusChain: Empty string");
+        registryDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getShipmentInfo(uint256 shipmentId) external view returns (
+        address sender,
+        uint256 insuranceValue,
+        uint256 registeredAt,
+        CargoStatus status,
+        bytes32 itemHash
+    ) {
+        Shipment memory s = shipments[shipmentId];
+        return (s.sender, s.insuranceValue, s.registeredAt, s.status, s.itemHash);
+    }
+}
